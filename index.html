@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Advanced River Router with Map Clicking</title>
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  
+  <style>
+    body, html { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; }
+    
+    /* Map cursor turns to crosshair when picking points */
+    #map { height: 100vh; width: 100vw; z-index: 1; }
+    #map.picking { cursor: crosshair; }
+    
+    .panel {
+      position: absolute; top: 15px; left: 15px; z-index: 1000;
+      background: white; padding: 20px; border-radius: 8px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.2); width: 340px;
+    }
+    h2 { margin: 0 0 5px 0; font-size: 18px; color: #1a365d; }
+    p.subtitle { font-size: 11px; color: #718096; margin: 0 0 15px 0; }
+    
+    .input-group { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; font-weight: bold; color: #4a5568; margin-bottom: 4px; }
+    input { width: 100%; padding: 8px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; font-size: 13px;}
+    
+    /* Interactive Pick Buttons */
+    .pick-btn { float: right; cursor: pointer; color: #3182ce; font-weight: normal; font-size: 11px; }
+    .pick-btn:hover { text-decoration: underline; }
+    .pick-btn.active { color: #e53e3e; font-weight: bold; text-decoration: none; animation: pulse 1.5s infinite; }
+    
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.5; }
+      100% { opacity: 1; }
+    }
+    
+    button.primary-btn {
+      width: 100%; padding: 10px; background: #3182ce; color: white;
+      border: none; border-radius: 4px; font-weight: bold; cursor: pointer;
+      margin-top: 10px; transition: background 0.3s;
+    }
+    button.primary-btn:hover { background: #2b6cb0; }
+    button.primary-btn:disabled { background: #a0aec0; cursor: not-allowed; }
+    
+    #status { margin-top: 12px; font-size: 12px; font-weight: bold; line-height: 1.4; }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <h2>Advanced River Route Finder</h2>
+    <p class="subtitle">Type a city name or click the map to select points</p>
+    
+    <div class="input-group">
+      <label>Start Location 
+        <span id="startPick" class="pick-btn" onclick="togglePick('start')">📍 Pick on Map</span>
+      </label>
+      <input type="text" id="startInput" value="Guwahati" placeholder="e.g. Guwahati OR 26.1, 91.7">
+    </div>
+    <div class="input-group">
+      <label>End Location 
+        <span id="endPick" class="pick-btn" onclick="togglePick('end')">📍 Pick on Map</span>
+      </label>
+      <input type="text" id="endInput" value="Chandpur, Bangladesh" placeholder="e.g. Chandpur OR 23.8, 90.4">
+    </div>
+    <button id="routeBtn" class="primary-btn" onclick="processRouting()">Find Waterway</button>
+    <div id="status" style="color: #e53e3e;"></div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <script>
+    const map = L.map('map').setView([24.5, 91.0], 7);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(map);
+
+    let currentRouteLine = null;
+    let markers = [];
+    let pickMode = null; // Tracks if user is clicking map for 'start' or 'end'
+
+    // --- MAP CLICK LOGIC ---
+    function togglePick(mode) {
+      const startBtn = document.getElementById('startPick');
+      const endBtn = document.getElementById('endPick');
+      const mapDiv = document.getElementById('map');
+
+      // Reset both buttons
+      startBtn.className = 'pick-btn'; endBtn.className = 'pick-btn';
+      startBtn.innerText = '📍 Pick on Map'; endBtn.innerText = '📍 Pick on Map';
+      
+      // If clicking the same button twice, turn off pick mode
+      if (pickMode === mode) {
+        pickMode = null;
+        mapDiv.classList.remove('picking');
+        return;
+      }
+
+      // Activate picking mode
+      pickMode = mode;
+      mapDiv.classList.add('picking');
+      
+      if (mode === 'start') {
+        startBtn.classList.add('active');
+        startBtn.innerText = '🛑 Click map to set...';
+      } else {
+        endBtn.classList.add('active');
+        endBtn.innerText = '🛑 Click map to set...';
+      }
+    }
+
+    map.on('click', function(e) {
+      if (!pickMode) return; // Do nothing if not in picking mode
+      
+      const lat = e.latlng.lat.toFixed(5);
+      const lng = e.latlng.lng.toFixed(5);
+      const coordStr = `${lat}, ${lng}`;
+
+      // Update input box
+      if (pickMode === 'start') {
+        document.getElementById('startInput').value = coordStr;
+      } else if (pickMode === 'end') {
+        document.getElementById('endInput').value = coordStr;
+      }
+
+      // Drop a temporary marker to show the click location
+      const tempMarker = L.marker([lat, lng]).addTo(map).bindPopup(pickMode === 'start' ? 'Start' : 'End').openPopup();
+      markers.push(tempMarker); // Store so it gets cleared when generating the route
+
+      // Automatically turn off picking mode after one click
+      togglePick(pickMode); 
+    });
+
+
+    // --- ROUTING ALGORITHMS ---
+    class MinHeap {
+      constructor() { this.heap = []; }
+      push(node, weight) { this.heap.push({node, weight}); this.bubbleUp(); }
+      pop() {
+        const min = this.heap[0];
+        const end = this.heap.pop();
+        if (this.heap.length > 0) { this.heap[0] = end; this.sinkDown(); }
+        return min;
+      }
+      bubbleUp() {
+        let idx = this.heap.length - 1;
+        const element = this.heap[idx];
+        while (idx > 0) {
+          let parentIdx = Math.floor((idx - 1) / 2);
+          let parent = this.heap[parentIdx];
+          if (element.weight >= parent.weight) break;
+          this.heap[parentIdx] = element;
+          this.heap[idx] = parent;
+          idx = parentIdx;
+        }
+      }
+      sinkDown() {
+        let idx = 0;
+        const length = this.heap.length;
+        const element = this.heap[0];
+        while (true) {
+          let leftChildIdx = 2 * idx + 1, rightChildIdx = 2 * idx + 2;
+          let leftChild, rightChild, swap = null;
+          if (leftChildIdx < length) {
+            leftChild = this.heap[leftChildIdx];
+            if (leftChild.weight < element.weight) swap = leftChildIdx;
+          }
+          if (rightChildIdx < length) {
+            rightChild = this.heap[rightChildIdx];
+            if ((swap === null && rightChild.weight < element.weight) || 
+                (swap !== null && rightChild.weight < leftChild.weight)) {
+              swap = rightChildIdx;
+            }
+          }
+          if (swap === null) break;
+          this.heap[idx] = this.heap[swap];
+          this.heap[swap] = element;
+          idx = swap;
+        }
+      }
+      isEmpty() { return this.heap.length === 0; }
+    }
+
+    function getDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371; 
+      const dLat = (lat2 - lat1) * Math.PI / 180, dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    async function getCoordinates(inputStr) {
+      inputStr = inputStr.trim();
+      const isCoord = /^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(inputStr);
+      if (isCoord) {
+        const parts = inputStr.split(',');
+        return [parseFloat(parts[0]), parseFloat(parts[1]), inputStr];
+      }
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(inputStr)}&limit=1`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.length === 0) throw new Error(`Could not find place: ${inputStr}`);
+      return [parseFloat(data[0].lat), parseFloat(data[0].lon), data[0].display_name];
+    }
+
+    async function processRouting() {
+      const startRaw = document.getElementById('startInput').value;
+      const endRaw = document.getElementById('endInput').value;
+      const statusElement = document.getElementById('status');
+      const btn = document.getElementById('routeBtn');
+
+      if (!startRaw || !endRaw) { statusElement.innerText = "Please enter both locations."; return; }
+
+      // Make sure picking mode is off before running
+      if (pickMode) togglePick(pickMode);
+
+      try {
+        btn.disabled = true;
+        
+        statusElement.style.color = "#3182ce";
+        statusElement.innerText = "Locating places...";
+        const [startLat, startLon, startName] = await getCoordinates(startRaw);
+        const [endLat, endLon, endName] = await getCoordinates(endRaw);
+        const start = [startLat, startLon], end = [endLat, endLon];
+
+        if (currentRouteLine) map.removeLayer(currentRouteLine);
+        markers.forEach(m => map.removeLayer(m));
+        markers = [];
+
+        markers.push(L.marker(start).addTo(map).bindPopup('<b>Start:</b><br>' + startName));
+        markers.push(L.marker(end).addTo(map).bindPopup('<b>End:</b><br>' + endName));
+        const bounds = L.latLngBounds([start, end]);
+        map.fitBounds(bounds, { padding: [50, 50] });
+
+        statusElement.innerText = "Fetching river network (approx. 10-20 sec)...";
+        
+        const latBuffer = Math.abs(bounds.getNorth() - bounds.getSouth()) * 0.2 || 0.2;
+        const lonBuffer = Math.abs(bounds.getEast() - bounds.getWest()) * 0.2 || 0.2;
+        const minLat = bounds.getSouth() - latBuffer, minLon = bounds.getWest() - lonBuffer;
+        const maxLat = bounds.getNorth() + latBuffer, maxLon = bounds.getEast() + lonBuffer;
+
+        const query = `[out:json][timeout:90];way["waterway"~"river|stream|canal"](${minLat},${minLon},${maxLat},${maxLon});out geom;`;
+        const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+        
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("Server busy. Try again.");
+        const data = await response.json();
+
+        statusElement.innerText = "Analyzing and auto-healing map gaps...";
+        const graph = {};
+        const allNodesData = [];
+        
+        data.elements.forEach(el => {
+          if (!el.geometry) return;
+          for (let i = 0; i < el.geometry.length - 1; i++) {
+            const p1 = `${el.geometry[i].lat},${el.geometry[i].lon}`;
+            const p2 = `${el.geometry[i+1].lat},${el.geometry[i+1].lon}`;
+            const dist = getDistance(el.geometry[i].lat, el.geometry[i].lon, el.geometry[i+1].lat, el.geometry[i+1].lon);
+            
+            if (!graph[p1]) { graph[p1] = {}; allNodesData.push({id: p1, lat: el.geometry[i].lat, lon: el.geometry[i].lon}); }
+            if (!graph[p2]) { graph[p2] = {}; allNodesData.push({id: p2, lat: el.geometry[i+1].lat, lon: el.geometry[i+1].lon}); }
+            
+            graph[p1][p2] = dist; graph[p2][p1] = dist;
+          }
+        });
+
+        const allNodes = Object.keys(graph);
+        if (allNodes.length === 0) throw new Error("No rivers mapped in this region.");
+
+        const deadEnds = allNodesData.filter(n => Object.keys(graph[n.id]).length === 1);
+        
+        deadEnds.forEach(deadEnd => {
+          let nearest = null;
+          let minD = 5.0; 
+          
+          allNodesData.forEach(other => {
+            if (deadEnd.id !== other.id) {
+              const d = getDistance(deadEnd.lat, deadEnd.lon, other.lat, other.lon);
+              if (d < minD) { minD = d; nearest = other; }
+            }
+          });
+          
+          if (nearest) {
+            graph[deadEnd.id][nearest.id] = minD;
+            graph[nearest.id][deadEnd.id] = minD;
+          }
+        });
+
+        let nearestStart = null, nearestEnd = null, minStartDist = Infinity, minEndDist = Infinity;
+        allNodesData.forEach(node => {
+          const dStart = getDistance(start[0], start[1], node.lat, node.lon);
+          const dEnd = getDistance(end[0], end[1], node.lat, node.lon);
+          if (dStart < minStartDist) { minStartDist = dStart; nearestStart = node.id; }
+          if (dEnd < minEndDist) { minEndDist = dEnd; nearestEnd = node.id; }
+        });
+
+        const distances = {}, previous = {};
+        const pq = new MinHeap();
+        
+        allNodes.forEach(n => distances[n] = Infinity);
+        distances[nearestStart] = 0;
+        pq.push(nearestStart, 0);
+
+        while (!pq.isEmpty()) {
+          const {node: current, weight: currentDist} = pq.pop();
+          if (current === nearestEnd) break;
+          if (currentDist > distances[current]) continue;
+
+          for (const neighbor in graph[current]) {
+            const alt = distances[current] + graph[current][neighbor];
+            if (alt < distances[neighbor]) {
+              distances[neighbor] = alt;
+              previous[neighbor] = current;
+              pq.push(neighbor, alt);
+            }
+          }
+        }
+
+        if (distances[nearestEnd] === Infinity) {
+          throw new Error("Gap is too large to auto-heal. Network broken.");
+        }
+
+        const path = [];
+        let curr = nearestEnd;
+        while (curr) {
+          const [lat, lon] = curr.split(',').map(Number);
+          path.unshift([lat, lon]);
+          curr = previous[curr];
+        }
+
+        currentRouteLine = L.polyline(path, { color: '#00bfff', weight: 5, opacity: 0.9 }).addTo(map);
+        map.fitBounds(currentRouteLine.getBounds(), { padding: [30, 30] });
+
+        statusElement.style.color = "#38a169";
+        statusElement.innerText = `Route connected successfully! Distance: ~${distances[nearestEnd].toFixed(1)} km`;
+
+      } catch (err) {
+        console.error(err);
+        statusElement.style.color = "#e53e3e";
+        statusElement.innerText = err.message || "An error occurred.";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
